@@ -70,9 +70,7 @@ function tokensToAdf(tokens?: RelaxedToken[]): AdfNode[] {
             return {
               type: "taskList",
               attrs: { localId: generateLocalId() },
-              content: token.items.map((item: RelaxedToken) =>
-                processTaskItem(item),
-              ),
+              content: processTaskListItems(token.items),
             };
           } else {
             return {
@@ -311,33 +309,8 @@ function processTaskItem(item: RelaxedToken): AdfNode {
         currentParagraphTokens = [];
       }
 
-      if (token.type === "list") {
-        // Check if nested list is a task list (all items have task: true)
-        const allItemsAreTasks = token.items.every(
-          (nestedItem: RelaxedToken) => nestedItem.task,
-        );
-
-        if (
-          allItemsAreTasks &&
-          token.items.some((nestedItem: RelaxedToken) => nestedItem.task)
-        ) {
-          itemContent.push({
-            type: "taskList",
-            attrs: { localId: generateLocalId() },
-            content: token.items.map((nestedItem: RelaxedToken) =>
-              processTaskItem(nestedItem),
-            ),
-          });
-        } else {
-          itemContent.push({
-            type: token.ordered ? "orderedList" : "bulletList",
-            ...(token.ordered ? { attrs: { order: token.start || 1 } } : {}),
-            content: token.items.map((nestedItem: RelaxedToken) =>
-              processListItem(nestedItem),
-            ),
-          });
-        }
-      } else {
+      // Skip nested lists here - they are handled by processTaskListItems
+      if (token.type !== "list") {
         const processed = tokensToAdf([token]);
         if (processed.length) {
           itemContent.push(...processed);
@@ -359,6 +332,51 @@ function processTaskItem(item: RelaxedToken): AdfNode {
     },
     content: itemContent,
   };
+}
+
+/**
+ * Processes task list items, handling nested task lists as siblings in the
+ * parent taskList's content array (as required by Jira's ADF format).
+ */
+function processTaskListItems(items: RelaxedToken[]): AdfNode[] {
+  const result: AdfNode[] = [];
+
+  for (const item of items) {
+    // First, add the task item itself (without nested lists in its content)
+    result.push(processTaskItem(item));
+
+    // Then, find and add any nested lists as siblings
+    for (const token of item.tokens || []) {
+      if (token.type === "list") {
+        const allItemsAreTasks = token.items.every(
+          (nestedItem: RelaxedToken) => nestedItem.task,
+        );
+
+        if (
+          allItemsAreTasks &&
+          token.items.some((nestedItem: RelaxedToken) => nestedItem.task)
+        ) {
+          // Nested task list - recursively process with same structure
+          result.push({
+            type: "taskList",
+            attrs: { localId: generateLocalId() },
+            content: processTaskListItems(token.items),
+          });
+        } else {
+          // Nested regular list
+          result.push({
+            type: token.ordered ? "orderedList" : "bulletList",
+            ...(token.ordered ? { attrs: { order: token.start || 1 } } : {}),
+            content: token.items.map((nestedItem: RelaxedToken) =>
+              processListItem(nestedItem),
+            ),
+          });
+        }
+      }
+    }
+  }
+
+  return result;
 }
 
 function getSafeText(token: RelaxedToken): string {
