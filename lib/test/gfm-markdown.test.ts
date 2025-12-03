@@ -114,3 +114,84 @@ test(`Handles mixed regular and task list items correctly`, async (t) => {
     t.is(item.type, "listItem");
   });
 });
+
+test(`Extracts nested bullet lists from task lists (Jira ADF schema requirement)`, async (t) => {
+  // Jira's ADF schema requires taskList to only contain taskItem nodes.
+  // When a task list has nested regular bullet items, they must be extracted
+  // and placed as siblings. To preserve document order, we split the taskList
+  // so extracted items appear in their original position.
+  //
+  // Input:
+  //   - [x] Task 1
+  //     - 1.1
+  //     - 1.2
+  //   - [x] Task 2
+  //
+  // Output order: taskList([Task1]), bulletList([1.1, 1.2]), taskList([Task2])
+  const markdown = `- [x] Task 1: Create module
+  - 1.1: Subtask one
+  - 1.2: Subtask two
+- [x] Task 2: Another task`;
+
+  const adf = await markdownToAdf(markdown);
+
+  // Should have 3 top-level nodes to preserve document order:
+  // taskList([Task1]), bulletList([1.1, 1.2]), taskList([Task2])
+  t.is(adf.content.length, 3, "Should have taskList + bulletList + taskList");
+
+  // First node should be a taskList containing Task 1 only
+  const taskList1 = adf.content[0]!;
+  t.is(taskList1.type, "taskList");
+  t.is(taskList1.content?.length, 1, "First taskList should have 1 taskItem (Task 1)");
+  t.true(
+    taskList1.content?.every((item: any) => item.type === "taskItem"),
+    "taskList should only contain taskItem nodes"
+  );
+
+  // Second node should be the extracted bulletList
+  const bulletList = adf.content[1]!;
+  t.is(bulletList.type, "bulletList");
+  t.is(bulletList.content?.length, 2, "bulletList should have 2 items (1.1, 1.2)");
+
+  // Third node should be a taskList containing Task 2
+  const taskList2 = adf.content[2]!;
+  t.is(taskList2.type, "taskList");
+  t.is(taskList2.content?.length, 1, "Second taskList should have 1 taskItem (Task 2)");
+});
+
+test(`Handles deeply nested task and bullet list combinations`, async (t) => {
+  // Test with multiple levels of nesting
+  const markdown = `- [x] Parent task
+  - [x] Nested task
+    - Regular nested bullet
+  - Another regular bullet`;
+
+  const adf = await markdownToAdf(markdown);
+
+  // Verify taskList doesn't contain bulletList at any level
+  function assertNoNestedBulletListsInTaskList(node: any, path = ""): void {
+    if (node.type === "taskList" && node.content) {
+      for (const child of node.content) {
+        t.not(
+          child.type,
+          "bulletList",
+          `Found bulletList inside taskList at ${path}`
+        );
+        t.not(
+          child.type,
+          "orderedList",
+          `Found orderedList inside taskList at ${path}`
+        );
+        if (child.content) {
+          assertNoNestedBulletListsInTaskList(child, `${path}/${child.type}`);
+        }
+      }
+    }
+  }
+
+  for (const node of adf.content) {
+    assertNoNestedBulletListsInTaskList(node, node.type);
+  }
+
+  t.pass("No bulletList or orderedList found inside taskList nodes");
+});

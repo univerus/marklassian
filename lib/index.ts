@@ -67,11 +67,11 @@ function tokensToAdf(tokens?: RelaxedToken[]): AdfNode[] {
             allItemsAreTasks &&
             token.items.some((item: RelaxedToken) => item.task)
           ) {
-            return {
-              type: "taskList",
-              attrs: { localId: generateLocalId() },
-              content: processTaskListItems(token.items),
-            };
+            // Process task list items, preserving document order.
+            // This may return multiple taskLists interleaved with bulletLists
+            // to maintain proper ordering when task items have nested regular lists.
+            // (Jira requires taskList to only contain taskItem nodes)
+            return processTaskListItemsWithExtractionPreservingOrder(token.items);
           } else {
             return {
               type: token.ordered ? "orderedList" : "bulletList",
@@ -83,9 +83,11 @@ function tokensToAdf(tokens?: RelaxedToken[]): AdfNode[] {
           }
 
         case "code":
+          // Don't default to "text" - preserve empty language for round-trip fidelity
+          // Jira's ADF schema accepts codeBlock without a language attribute
           return {
             type: "codeBlock",
-            attrs: { language: token.lang || "text" },
+            ...(token.lang ? { attrs: { language: token.lang } } : {}),
             content: [
               {
                 type: "text",
@@ -377,6 +379,156 @@ function processTaskListItems(items: RelaxedToken[]): AdfNode[] {
   }
 
   return result;
+}
+
+/**
+ * Processes task list items and interleaves extracted non-taskItem nodes.
+ * 
+ * Jira's ADF schema requires taskList to only contain taskItem (and nested taskList) nodes.
+ * Regular bulletList/orderedList nodes that appear as nested content must be extracted
+ * and placed as siblings. To preserve document order, we return nodes in sequence:
+ * [taskItem1, extractedList1a, extractedList1b, taskItem2, taskItem3, extractedList3a, ...]
+ * 
+ * The caller will split this into taskList content (taskItems only) and sibling lists.
+ * 
+ * @returns Array of nodes in document order, mixed taskItems and extracted lists
+ */
+function processTaskListItemsInterleaved(items: RelaxedToken[]): {
+  interleavedNodes: Array<{ type: 'taskItem' | 'extracted'; node: AdfNode }>;
+} {
+  const interleavedNodes: Array<{ type: 'taskItem' | 'extracted'; node: AdfNode }> = [];
+
+  for (const item of items) {
+    // Add the task item itself
+    interleavedNodes.push({ type: 'taskItem', node: processTaskItem(item) });
+
+    // Process nested lists - extract them right after their parent task item
+    for (const token of item.tokens || []) {
+      if (token.type === "list") {
+        const allItemsAreTasks = token.items.every(
+          (nestedItem: RelaxedToken) => nestedItem.task,
+        );
+
+        if (
+          allItemsAreTasks &&
+          token.items.some((nestedItem: RelaxedToken) => nestedItem.task)
+        ) {
+          // Nested task list - recursively process and add to interleaved output
+          const nested = processTaskListItemsInterleaved(token.items);
+          // The nested taskList itself goes in the interleaved output
+          const nestedTaskItems = nested.interleavedNodes
+            .filter(n => n.type === 'taskItem')
+            .map(n => n.node);
+          
+          interleavedNodes.push({
+            type: 'taskItem', // Nested taskList can stay in parent taskList
+            node: {
+              type: "taskList",
+              attrs: { localId: generateLocalId() },
+              content: nestedTaskItems,
+            },
+          });
+          
+          // But any extracted lists from deeper nesting need to come out
+          const nestedExtracted = nested.interleavedNodes.filter(n => n.type === 'extracted');
+          interleavedNodes.push(...nestedExtracted);
+        } else {
+          // Nested regular list - EXTRACT it right after this task item
+          interleavedNodes.push({
+            type: 'extracted',
+            node: {
+              type: token.ordered ? "orderedList" : "bulletList",
+              ...(token.ordered ? { attrs: { order: token.start || 1 } } : {}),
+              content: token.items.map((nestedItem: RelaxedToken) =>
+                processListItem(nestedItem),
+              ),
+            },
+          });
+        }
+      }
+    }
+  }
+
+  return { interleavedNodes };
+}
+
+/**
+ * Processes task list items and extracts non-taskItem nodes, preserving document order.
+ * 
+ * Jira's ADF schema requires taskList to only contain taskItem (and nested taskList) nodes.
+ * Regular bulletList/orderedList nodes that appear as nested content must be extracted.
+ * 
+ * To preserve document order, this function:
+ * 1. Processes items in order, tracking taskItems and extracted lists
+ * 2. Groups consecutive taskItems into taskLists
+ * 3. Outputs taskLists and bulletLists in document order
+ * 
+ * For example, with input:
+ *   - [x] Task 1
+ *     - 1.1: Subtask
+ *   - [x] Task 2
+ * 
+ * Output order is: taskList([Task1]), bulletList([1.1]), taskList([Task2])
+ * NOT: taskList([Task1, Task2]), bulletList([1.1])
+ * 
+ * @returns Array of ADF nodes in document order (taskLists and extracted lists interleaved)
+ */
+function processTaskListItemsWithExtractionPreservingOrder(items: RelaxedToken[]): AdfNode[] {
+  const { interleavedNodes } = processTaskListItemsInterleaved(items);
+  
+  // Group consecutive taskItems into taskLists, preserving extracted lists in order
+  const result: AdfNode[] = [];
+  let currentTaskItems: AdfNode[] = [];
+  
+  const flushTaskItems = () => {
+    if (currentTaskItems.length > 0) {
+      result.push({
+        type: "taskList",
+        attrs: { localId: generateLocalId() },
+        content: currentTaskItems,
+      });
+      currentTaskItems = [];
+    }
+  };
+  
+  for (const { type, node } of interleavedNodes) {
+    if (type === 'taskItem') {
+      currentTaskItems.push(node);
+    } else {
+      // Extracted list - flush any pending taskItems first, then add the list
+      flushTaskItems();
+      result.push(node);
+    }
+  }
+  
+  // Don't forget any remaining taskItems
+  flushTaskItems();
+  
+  return result;
+}
+
+/**
+ * Legacy function for backwards compatibility.
+ * Returns taskItems and extractedLists separately (loses document order).
+ */
+function processTaskListItemsWithExtraction(items: RelaxedToken[]): {
+  taskItems: AdfNode[];
+  extractedLists: AdfNode[];
+} {
+  const { interleavedNodes } = processTaskListItemsInterleaved(items);
+  
+  const taskItems: AdfNode[] = [];
+  const extractedLists: AdfNode[] = [];
+  
+  for (const { type, node } of interleavedNodes) {
+    if (type === 'taskItem') {
+      taskItems.push(node);
+    } else {
+      extractedLists.push(node);
+    }
+  }
+
+  return { taskItems, extractedLists };
 }
 
 function getSafeText(token: RelaxedToken): string {

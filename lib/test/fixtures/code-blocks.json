@@ -28,9 +28,6 @@
     },
     {
       "type": "codeBlock",
-      "attrs": {
-        "language": "text"
-      },
       "content": [
         {
           "type": "text",
